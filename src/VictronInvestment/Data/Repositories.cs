@@ -46,6 +46,14 @@ public class EnergyRepository
     public async Task<bool> IsCacheStaleAsync(int year)
     {
         using var connection = new SqliteConnection(_connectionString);
+
+        var count = await connection.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM MonthlyEnergy WHERE Year = @Year",
+            new { Year = year });
+
+        // If we have fewer than 2 months cached, treat as stale (incomplete fetch)
+        if (count < 2) return true;
+
         var fetchedAt = await connection.ExecuteScalarAsync<string?>(
             "SELECT MAX(FetchedAt) FROM MonthlyEnergy WHERE Year = @Year",
             new { Year = year });

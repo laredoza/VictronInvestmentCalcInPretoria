@@ -53,8 +53,11 @@ public class VictronApiService
 
         var installationId = _settings.InstallationId;
 
-        // Calculate epoch timestamps for the year range
-        var startDate = new DateTimeOffset(year, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        // Calculate epoch timestamps for the year range.
+        // Victron timestamps are shifted: Dec 31 of prev year = January data.
+        // So we start from Dec 1 of the previous year to capture January,
+        // and end at Dec 31 of the year (or now) to capture December.
+        var startDate = new DateTimeOffset(year - 1, 12, 1, 0, 0, 0, TimeSpan.Zero);
         var endDate = year < DateTime.Now.Year
             ? new DateTimeOffset(year, 12, 31, 23, 59, 59, TimeSpan.Zero)
             : new DateTimeOffset(DateTime.UtcNow);
@@ -88,8 +91,12 @@ public class VictronApiService
         // Gb = Grid to battery, Gc = Grid to consumers
         // Bc = Battery to consumers, Bg = Battery to grid
 
-        // Collect all timestamps and group by month
-        var monthlyData = new Dictionary<int, Dictionary<string, decimal>>();
+        // Victron timestamps use the last day of each month (e.g. 2024-01-31 = January).
+        // The API returns the previous year's December as the first point (e.g. 2023-12-31
+        // appears in the 2024 request). We treat this as December of (year-1), and since
+        // we process years sequentially, we include it as December of the requested year - 1.
+        // We build a (year, month) keyed dictionary to handle this correctly.
+        var monthlyData = new Dictionary<(int Year, int Month), Dictionary<string, decimal>>();
 
         foreach (var (code, records) in stats.Records)
         {
@@ -100,29 +107,31 @@ public class VictronApiService
                 var timestamp = record[0];
                 var value = (decimal)record[1];
 
-                // Convert epoch to month (Victron returns milliseconds)
+                // Convert epoch to date (Victron returns milliseconds).
+                // Victron timestamps are the last day of the previous month
+                // (e.g. 2025-12-31 = January 2026 data). Adding 1 day maps to
+                // the 1st of the actual month the data represents.
                 var epochMs = (long)timestamp;
-                var date = DateTimeOffset.FromUnixTimeMilliseconds(epochMs).UtcDateTime;
-                if (date.Year != year) continue;
+                var date = DateTimeOffset.FromUnixTimeMilliseconds(epochMs).UtcDateTime.AddDays(1);
 
-                var month = date.Month;
+                var key = (date.Year, date.Month);
 
-                if (!monthlyData.ContainsKey(month))
-                    monthlyData[month] = new Dictionary<string, decimal>();
+                if (!monthlyData.ContainsKey(key))
+                    monthlyData[key] = new Dictionary<string, decimal>();
 
-                if (!monthlyData[month].ContainsKey(code))
-                    monthlyData[month][code] = 0m;
+                if (!monthlyData[key].ContainsKey(code))
+                    monthlyData[key][code] = 0m;
 
-                monthlyData[month][code] += value;
+                monthlyData[key][code] += value;
             }
         }
 
         var now = DateTime.Now;
         return monthlyData
-            .OrderBy(kv => kv.Key)
+            .OrderBy(kv => kv.Key.Year).ThenBy(kv => kv.Key.Month)
             .Select(kv =>
             {
-                var month = kv.Key;
+                var (dataYear, month) = kv.Key;
                 var codes = kv.Value;
 
                 decimal GetCode(string c) => codes.TryGetValue(c, out var v) ? v : 0m;
@@ -132,7 +141,7 @@ public class VictronApiService
 
                 return new MonthlyEnergy
                 {
-                    Year = year,
+                    Year = dataYear,
                     Month = month,
                     Pv = pv,
                     Load = load,

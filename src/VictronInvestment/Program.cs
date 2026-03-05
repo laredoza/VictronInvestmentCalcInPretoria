@@ -48,16 +48,15 @@ catch (Exception ex)
 var currentYear = DateTime.Now.Year;
 var allMonthlyData = new List<(MonthlyEnergy Energy, Tariff Tariff, decimal SavingsRand)>();
 
+// Fetch and cache data for each year
 for (var year = startYear; year <= currentYear; year++)
 {
-    List<MonthlyEnergy> energyData;
-
     if (await energyRepo.IsCacheStaleAsync(year))
     {
         Console.WriteLine($"Fetching {year} data from Victron VRM API...");
         try
         {
-            energyData = await apiService.FetchYearlyEnergyAsync(year);
+            var energyData = await apiService.FetchYearlyEnergyAsync(year);
             foreach (var e in energyData)
                 await energyRepo.UpsertMonthlyEnergyAsync(e);
         }
@@ -66,16 +65,19 @@ for (var year = startYear; year <= currentYear; year++)
             Console.ForegroundColor = ConsoleColor.Yellow;
             Console.WriteLine($"  Warning: Could not fetch {year}: {ex.Message}");
             Console.ResetColor();
-            energyData = await energyRepo.GetCachedEnergyAsync(year);
-            if (energyData.Count == 0) continue;
-            Console.WriteLine($"  Using cached data for {year}.");
         }
     }
     else
     {
         Console.WriteLine($"Using cached data for {year}.");
-        energyData = await energyRepo.GetCachedEnergyAsync(year);
     }
+}
+
+// Build report from cached data (deduplicated by the database)
+for (var year = startYear; year <= currentYear; year++)
+{
+    var energyData = await energyRepo.GetCachedEnergyAsync(year);
+    if (energyData.Count == 0) continue;
 
     var missingTariffMonths = new List<string>();
 
