@@ -1,0 +1,149 @@
+using System.Net.Http.Json;
+using System.Text.Json;
+using VictronInvestment.Configuration;
+using VictronInvestment.Models;
+
+namespace VictronInvestment.Services;
+
+public class VictronApiService
+{
+    private readonly HttpClient _httpClient;
+    private readonly VictronSettings _settings;
+    private string? _authToken;
+
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true
+    };
+
+    public VictronApiService(HttpClient httpClient, VictronSettings settings)
+    {
+        _httpClient = httpClient;
+        _httpClient.BaseAddress = new Uri(settings.ApiBaseUrl);
+        _httpClient.DefaultRequestHeaders.Add("Accept", "application/json");
+        _settings = settings;
+    }
+
+    public async Task AuthenticateAsync()
+    {
+        var loginBody = new
+        {
+            username = _settings.Username,
+            password = _settings.Password
+        };
+
+        var response = await _httpClient.PostAsJsonAsync("v2/auth/login", loginBody);
+        var content = await response.Content.ReadAsStringAsync();
+
+        if (!response.IsSuccessStatusCode)
+            throw new Exception($"Authentication failed ({response.StatusCode}): {content}");
+
+        var authResponse = JsonSerializer.Deserialize<VictronAuthResponse>(content, JsonOptions);
+
+        if (authResponse == null || string.IsNullOrEmpty(authResponse.Token))
+            throw new Exception($"Authentication failed: no token received. Response: {content}");
+
+        _authToken = authResponse.Token;
+    }
+
+    public async Task<List<MonthlyEnergy>> FetchYearlyEnergyAsync(int year)
+    {
+        if (_authToken == null)
+            throw new InvalidOperationException("Not authenticated. Call AuthenticateAsync first.");
+
+        var installationId = _settings.InstallationId;
+
+        // Calculate epoch timestamps for the year range
+        var startDate = new DateTimeOffset(year, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var endDate = year < DateTime.Now.Year
+            ? new DateTimeOffset(year, 12, 31, 23, 59, 59, TimeSpan.Zero)
+            : new DateTimeOffset(DateTime.UtcNow);
+
+        var startEpoch = startDate.ToUnixTimeSeconds();
+        var endEpoch = endDate.ToUnixTimeSeconds();
+
+        var url = $"v2/installations/{installationId}/stats?type=kwh&interval=months&start={startEpoch}&end={endEpoch}";
+
+        using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        request.Headers.Add("X-Authorization", $"Bearer {_authToken}");
+
+        var response = await _httpClient.SendAsync(request);
+        var content = await response.Content.ReadAsStringAsync();
+
+        if (!response.IsSuccessStatusCode)
+            throw new Exception($"Failed to fetch energy data for {year} ({response.StatusCode}): {content}");
+
+        var statsResponse = JsonSerializer.Deserialize<VictronStatsResponse>(content, JsonOptions);
+
+        if (statsResponse is not { Success: true })
+            throw new Exception($"Stats API error for {year}: {content}");
+
+        return ConvertToMonthlyEnergy(year, statsResponse);
+    }
+
+    private static List<MonthlyEnergy> ConvertToMonthlyEnergy(int year, VictronStatsResponse stats)
+    {
+        // Victron energy flow codes:
+        // Pb = PV to battery, Pg = PV to grid, Pc = PV to consumers
+        // Gb = Grid to battery, Gc = Grid to consumers
+        // Bc = Battery to consumers, Bg = Battery to grid
+
+        // Collect all timestamps and group by month
+        var monthlyData = new Dictionary<int, Dictionary<string, decimal>>();
+
+        foreach (var (code, records) in stats.Records)
+        {
+            foreach (var record in records)
+            {
+                if (record.Count < 2) continue;
+
+                var timestamp = record[0];
+                var value = (decimal)record[1];
+
+                // Convert epoch to month (Victron returns milliseconds)
+                var epochMs = (long)timestamp;
+                var date = DateTimeOffset.FromUnixTimeMilliseconds(epochMs).UtcDateTime;
+                if (date.Year != year) continue;
+
+                var month = date.Month;
+
+                if (!monthlyData.ContainsKey(month))
+                    monthlyData[month] = new Dictionary<string, decimal>();
+
+                if (!monthlyData[month].ContainsKey(code))
+                    monthlyData[month][code] = 0m;
+
+                monthlyData[month][code] += value;
+            }
+        }
+
+        var now = DateTime.Now;
+        return monthlyData
+            .OrderBy(kv => kv.Key)
+            .Select(kv =>
+            {
+                var month = kv.Key;
+                var codes = kv.Value;
+
+                decimal GetCode(string c) => codes.TryGetValue(c, out var v) ? v : 0m;
+
+                var pv = GetCode("Pb") + GetCode("Pg") + GetCode("Pc");
+                var load = GetCode("Pc") + GetCode("Gc") + GetCode("Bc");
+
+                return new MonthlyEnergy
+                {
+                    Year = year,
+                    Month = month,
+                    Pv = pv,
+                    Load = load,
+                    Export = GetCode("Pg") + GetCode("Bg"),
+                    Import = GetCode("Gc") + GetCode("Gb"),
+                    Charge = GetCode("Pb") + GetCode("Gb"),
+                    Discharge = GetCode("Bc") + GetCode("Bg"),
+                    FetchedAt = now
+                };
+            })
+            .Where(e => e.Pv > 0 || e.Load > 0)
+            .ToList();
+    }
+}
