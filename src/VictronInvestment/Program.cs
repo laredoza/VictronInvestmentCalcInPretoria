@@ -189,8 +189,10 @@ if (totalInvestment > 0 && allMonthlyData.Count > 0)
     {
         var remaining = totalInvestment - grandTotal;
 
-        // Calculate average monthly savings from last 12 months of data
+        // Calculate average monthly savings from last 12 completed months (exclude current month)
+        var now = DateTime.Now;
         var recentMonths = allMonthlyData
+            .Where(x => x.Energy.Year < now.Year || (x.Energy.Year == now.Year && x.Energy.Month < now.Month))
             .OrderByDescending(x => x.Energy.Year)
             .ThenByDescending(x => x.Energy.Month)
             .Take(12)
